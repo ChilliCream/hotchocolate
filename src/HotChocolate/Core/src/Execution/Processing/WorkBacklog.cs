@@ -4,8 +4,10 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using HotChocolate.Execution.Instrumentation;
+using HotChocolate.Execution.Pipeline.Complexity;
 using HotChocolate.Execution.Processing.Internal;
 using HotChocolate.Execution.Processing.Plan;
+using HotChocolate.Execution.Properties;
 
 namespace HotChocolate.Execution.Processing
 {
@@ -17,16 +19,12 @@ namespace HotChocolate.Execution.Processing
         private readonly WorkQueue _serial = new();
         private readonly SuspendedWorkQueue _suspended = new();
         private readonly QueryPlanStateMachine _stateMachine = new();
+        private TaskCompletionSource<bool> _completion = default!;
 
-        private int _processors = 1;
-        private bool _mainIsPaused;
+        private bool _completed;
+        private int _processors;
         private IRequestContext _requestContext = default!;
         private IDiagnosticEvents _diagnosticEvents = default!;
-
-        public WorkBacklog()
-        {
-            _work.BacklogEmpty += (sender, args) => BacklogEmpty?.Invoke(sender, args);
-        }
 
         /// <inheritdoc/>
         public event EventHandler<EventArgs>? BackPressureLimitExceeded;
@@ -35,29 +33,47 @@ namespace HotChocolate.Execution.Processing
         public event EventHandler<EventArgs>? BacklogEmpty;
 
         /// <inheritdoc/>
+        public Task Completion => _completion.Task;
+
+        /// <inheritdoc/>
         public bool IsEmpty => _work.IsEmpty && _serial.IsEmpty;
 
         /// <inheritdoc/>
-        public bool IsRunning =>
-            _work.IsRunning ||
-            _serial.IsRunning ||
-           !_stateMachine.IsCompleted ||
-           _processors > 1;
+        public bool HasRunningTasks =>
+            _work.HasRunningTasks ||
+            _serial.HasRunningTasks ||
+           !_stateMachine.IsCompleted;
 
         internal void Initialize(OperationContext operationContext, QueryPlan queryPlan)
         {
+            Clear();
+
+            if (BackPressureLimitExceeded is null || BacklogEmpty is null)
+            {
+                throw new InvalidOperationException(
+                    Resources.WorkBacklog_NotFullyInitialized);
+            }
+
+            _completion = new TaskCompletionSource<bool>();
             _requestContext = operationContext.RequestContext;
             _diagnosticEvents = operationContext.RequestContext.DiagnosticEvents;
             _stateMachine.Initialize(operationContext, queryPlan);
+            _requestContext.RequestAborted.Register(Cancel);
         }
 
         /// <inheritdoc />
-        public int TryTake(IExecutionTask?[] buffer, bool main)
+        public int TryTake(IExecutionTask?[] buffer)
         {
+            var size = 0;
+
+            if (_completed)
+            {
+                return default;
+            }
+
             lock (_sync)
             {
-                var size = 0;
-                WorkQueue work = main && _stateMachine.IsSerial ? _serial : _work;
+                WorkQueue work = _stateMachine.IsSerial ? _serial : _work;
 
                 for (var i = 0; i < buffer.Length; i++)
                 {
@@ -93,7 +109,7 @@ namespace HotChocolate.Execution.Processing
                     WorkQueue work = task.IsSerial ? _serial : _work;
                     backlogSize = work.Push(task);
 
-                    if (backlogSize > CalculateScalePressure() || _mainIsPaused && _processors == 1)
+                    if (backlogSize > CalculateScalePressure() || _processors == 0)
                     {
                         scaled = TryScaleUnsafe();
                         processors = _processors;
@@ -109,7 +125,7 @@ namespace HotChocolate.Execution.Processing
             {
                 // we invoke the scale diagnostic event after leaving the lock to not block
                 // if a an event listener is badly implemented.
-                _diagnosticEvents.ScaleTaskProcessors(_requestContext, backlogSize, processors);
+                _diagnosticEvents.ScaleTaskProcessorsUp(_requestContext, backlogSize, processors);
             }
         }
 
@@ -131,7 +147,7 @@ namespace HotChocolate.Execution.Processing
                 {
                     IExecutionTask task = tasks[i]!;
                     tasks[i] = null;
-                    Debug.Assert(task != null, "A task slot is not allowed to be empty.");
+                    Debug.Assert(task != null!, "A task slot is not allowed to be empty.");
 
                     if (_stateMachine.Register(task))
                     {
@@ -144,7 +160,14 @@ namespace HotChocolate.Execution.Processing
                     }
                 }
 
-                if (backlogSize > CalculateScalePressure() || _mainIsPaused && _processors == 1)
+                // if the state machine is in serial mode and we already ave one processor running
+                // we do not want to scale.
+                if (_stateMachine.IsSerial && _processors > 0)
+                {
+                    return;
+                }
+
+                if (backlogSize > CalculateScalePressure() || _processors == 0)
                 {
                     scaled = TryScaleUnsafe();
                     processors = _processors;
@@ -155,7 +178,7 @@ namespace HotChocolate.Execution.Processing
             {
                 // we invoke the scale diagnostic event after leaving the lock to not block
                 // if a an event listener is badly implemented.
-                _diagnosticEvents.ScaleTaskProcessors(_requestContext, backlogSize, processors);
+                _diagnosticEvents.ScaleTaskProcessorsUp(_requestContext, backlogSize, processors);
             }
         }
 
@@ -181,9 +204,9 @@ namespace HotChocolate.Execution.Processing
                 // we first complete the task on the state machine so that if we are completing
                 // the last task the state machine is marked as complete before the work queue
                 // signals that it is complete.
-                if (_stateMachine.Complete(task) && !_suspended.IsEmpty)
+                if (_stateMachine.Complete(task) && _suspended.HasWork)
                 {
-                    TryEnqueueSuspended();
+                    TryEnqueueSuspendedUnsafe();
                 }
 
                 // determine the work queue.
@@ -197,16 +220,17 @@ namespace HotChocolate.Execution.Processing
                 // if there is now more work and the state machine is not completed yet we will
                 // close open steps and reevaluate. This can happen if optional resolver tasks
                 // are not enqueued.
-                while (!_stateMachine.IsCompleted &&
-                    _work.IsEmpty &&
-                    _serial.IsEmpty &&
-                    !_work.IsRunning &&
-                    !_serial.IsRunning)
+                while (NeedsCompletion())
                 {
-                    if (_stateMachine.CompleteNext() && !_suspended.IsEmpty)
+                    if (_stateMachine.CompleteNext() && _suspended.HasWork)
                     {
-                        TryEnqueueSuspended();
+                        TryEnqueueSuspendedUnsafe();
                     }
+                }
+
+                if (TryCompleteUnsafe())
+                {
+                    return;
                 }
             }
 
@@ -214,116 +238,129 @@ namespace HotChocolate.Execution.Processing
             {
                 // we invoke the scale diagnostic event after leaving the lock to not block
                 // if a an event listener is badly implemented.
-                _diagnosticEvents.ScaleTaskProcessors(_requestContext, backlogSize, processors);
+                _diagnosticEvents.ScaleTaskProcessorsUp(_requestContext, backlogSize, processors);
             }
 
-            void TryEnqueueSuspended()
+            void TryEnqueueSuspendedUnsafe()
             {
                 // note that backlog pressure is only measured on the default work queue since the
                 // serial work queue is not scaled by default.
                 _suspended.CopyTo(_work, _serial, _stateMachine);
                 backlogSize = _work.Count;
 
-                if (backlogSize > CalculateScalePressure() || _mainIsPaused && _processors == 1)
+                // if the state machine is in serial mode and we already ave one processor running
+                // we do not want to scale.
+                if (_stateMachine.IsSerial && _processors > 0)
+                {
+                    return;
+                }
+
+                if (backlogSize > CalculateScalePressure() || _processors == 0)
                 {
                     scaled = TryScaleUnsafe();
                     processors = _processors;
                 }
             }
-        }
 
-        /// <inheritdoc/>
-        public async Task WaitForWorkAsync(CancellationToken cancellationToken)
-        {
-            // we do not have any code to switch between serial and parallel work since the wait
-            // for work is only meant for parallel work since the serial work is executed in
-            // one stream.
-
-            lock (_sync)
-            {
-                // if we have work we will not wait and end waiting for new work.
-                if (!_work.IsEmpty || _work.IsEmpty && !IsRunning)
-                {
-                    return;
-                }
-
-                // mark the main processor as being paused.
-                _mainIsPaused = true;
-            }
-
-            try
-            {
-                // lets take the first thing in the in progress list an wait for it.
-                if (_work.TryPeekInProgress(out IExecutionTask? executionTask))
-                {
-                    await executionTask
-                        .WaitForCompletionAsync(cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    // if we have no work in progress we will just wait for 2 spins for a second.
-                    Thread.SpinWait(2);
-
-                    // now lets see if there is new work or if we have completed.
-                    if (!_work.IsEmpty || _work.IsEmpty && !IsRunning)
-                    {
-                        return;
-                    }
-
-                    // if we are still running and there is no work in progress that we can await
-                    // we will yield the task back to the task scheduler for a second and then
-                    // complete waiting.
-                    await Task.Yield();
-                }
-            }
-            finally
-            {
-                // mark the main task as in progress again.
-                _mainIsPaused = false;
-            }
+            bool NeedsCompletion()
+                => !_stateMachine.IsCompleted &&
+                   _work.IsEmpty &&
+                   _serial.IsEmpty &&
+                   !_work.HasRunningTasks &&
+                   !_serial.HasRunningTasks;
         }
 
         /// <inheritdoc/>
         public bool TryCompleteProcessor()
         {
-            var changedScale = false;
-            var processors = _processors;
-            var backlogSize = 0;
+            var firstTry = true;
+            int processors;
+            int backlogSize;
 
-            try
+            RETRY:
+
+            // if the execution is already completed or if the completion task is
+            // null we scale down.
+            if (_completed ||
+                _completion is null! ||
+                _requestContext.RequestAborted.IsCancellationRequested)
             {
-                lock (_sync)
-                {
-                    if (_mainIsPaused && _processors == 2 && !_work.IsEmpty)
-                    {
-                        return false;
-                    }
+                return true;
+            }
 
-                    changedScale = true;
-                    processors = --_processors;
-                    backlogSize = _work.Count;
-                    return true;
+            // if there is still work we keep on working. We check this here to
+            // try to avoid the lock.
+            if (!_work.IsEmpty)
+            {
+                return false;
+            }
+
+            lock (_sync)
+            {
+                if (!_work.IsEmpty)
+                {
+                    return false;
+                }
+
+                processors = _processors;
+
+                // if the backlog is empty, this is the last processor and all tasks are
+                // running we will signal that there is no more work that we can do.
+                if (firstTry && processors == 1 && _work.HasRunningTasks)
+                {
+                    firstTry = false;
+                    BacklogEmpty?.Invoke(this, EventArgs.Empty);
+                    goto RETRY;
+                }
+
+                processors = --_processors;
+                backlogSize = _work.Count;
+
+                // if we are the last processor to shut down we will check
+                // if the execution is completed.
+                if (processors == 0)
+                {
+                    TryCompleteUnsafe();
                 }
             }
-            finally
+
+            // we invoke the scale diagnostic event after leaving the lock to not block
+            // if a an event listener is badly implemented.
+            _diagnosticEvents.ScaleTaskProcessorsDown(
+                _requestContext,
+                backlogSize,
+                processors);
+            return true;
+        }
+
+        private void Cancel()
+        {
+            lock (_sync)
             {
-                if (changedScale)
+                _completed = true;
+                if (_completion is not null!)
                 {
-                    // we invoke the scale diagnostic event after leaving the lock to not block
-                    // if a an event listener is badly implemented.
-                    _diagnosticEvents.ScaleTaskProcessors(_requestContext, backlogSize, processors);
+                    _completion.TrySetCanceled();
                 }
             }
         }
 
         public void Clear()
         {
-            _work.Clear();
-            _suspended.Clear();
-            _stateMachine.Clear();
-            _processors = 1;
-            BackPressureLimitExceeded = null;
+            lock (_sync)
+            {
+                if (_completion is not null!)
+                {
+                    _completion.TrySetCanceled();
+                    _completion = default!;
+                }
+
+                _work.Clear();
+                _suspended.Clear();
+                _stateMachine.Clear();
+                _processors = 0;
+                _completed = false;
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -339,17 +376,47 @@ namespace HotChocolate.Execution.Processing
             return false;
         }
 
-        private int CalculateScalePressure() =>
-            _processors switch
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int CalculateScalePressure()
+            => _processors switch
             {
+                0 => 1,
                 1 => 4,
-                2 => 8,
-                3 => 16,
-                4 => 32,
-                5 => 64,
-                6 => 128,
-                7 => 256,
-                _ => 512
+                2 => 16,
+                3 => 64,
+                4 => 128,
+                _ => throw new NotSupportedException("The scale size is not supported.")
             };
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryCompleteUnsafe()
+        {
+            if (HasCompleted())
+            {
+                _completed = true;
+                _completion.TrySetResult(true);
+                return true;
+            }
+
+            if (IsCanceled())
+            {
+                _completed = true;
+                _completion.TrySetCanceled();
+                return true;
+            }
+
+            return false;
+
+            bool HasCompleted()
+                => !_completed &&
+                _processors == 0 &&
+                IsEmpty &&
+                !HasRunningTasks;
+
+            bool IsCanceled()
+                => !_completed &&
+                _processors == 0 &&
+                _requestContext.RequestAborted.IsCancellationRequested;
+        }
     }
 }

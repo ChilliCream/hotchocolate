@@ -1,5 +1,5 @@
 using System;
-using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -13,6 +13,7 @@ using HotChocolate.ConferencePlanner.Sessions;
 using HotChocolate.ConferencePlanner.Speakers;
 using HotChocolate.ConferencePlanner.Tracks;
 using HotChocolate.Execution;
+using HotChocolate.Execution.Instrumentation;
 using HotChocolate.Execution.Processing;
 using HotChocolate.Language;
 using Microsoft.EntityFrameworkCore;
@@ -64,17 +65,22 @@ namespace HotChocolate.ConferencePlanner
             {
                 throw new InvalidOperationException("The request failed.");
             }
+
+            if (result is IDisposable d)
+            {
+                // d.Dispose();
+            }
         }
 
-        public async Task<string> PrintQueryPlanAsync(string requestDocument) 
+        public async Task<string> PrintQueryPlanAsync(string requestDocument)
         {
             IRequestExecutor executor = await ExecutorResolver.GetRequestExecutorAsync();
 
             string hash = _md5.ComputeHash(Encoding.UTF8.GetBytes(requestDocument).AsSpan());
             DocumentNode document = Utf8GraphQLParser.Parse(requestDocument);
-            var operation =  document.Definitions.OfType<OperationDefinitionNode>().First();
+            var operation = document.Definitions.OfType<OperationDefinitionNode>().First();
 
-            IPreparedOperation preparedOperation = 
+            IPreparedOperation preparedOperation =
                 OperationCompiler.Compile(
                     hash,
                     document,
@@ -141,6 +147,8 @@ namespace HotChocolate.ConferencePlanner
                     .AddDataLoader<SpeakerByIdDataLoader>()
                     .AddDataLoader<TrackByIdDataLoader>()
 
+                    // .AddDiagnosticEventListener<BatchDiagnostics>()
+
                     // we make sure that the db exists and prefill it with conference data.
                     .EnsureDatabaseIsCreated()
 
@@ -148,6 +156,75 @@ namespace HotChocolate.ConferencePlanner
                     // for our demo we are using a in-memory pub/sub system.
                     .AddInMemorySubscriptions();
 
+        }
+    }
+
+    public class BatchDiagnostics : DiagnosticEventListener
+    {
+        public override IActivityScope ExecuteRequest(IRequestContext context)
+        {
+            var scope = new RequestScope();
+            context.ContextData[nameof(RequestScope)] = scope;
+            return scope;
+        }
+
+        public override IActivityScope DispatchBatch(
+            IRequestContext context)
+        {
+            return new BatchScope(((RequestScope)context.ContextData[nameof(RequestScope)]!));
+        }
+
+        public override void ScaleTaskProcessorsUp(
+            IRequestContext context,
+            int backlogSize,
+            int processors)
+        {
+            TimeSpan timeSpan = ((RequestScope)context.ContextData[nameof(RequestScope)]!).Elapsed;
+            Console.WriteLine($"{timeSpan} Scaled up to {processors} processors with backlog size {backlogSize}.");
+        }
+
+        public override void ScaleTaskProcessorsDown(
+            IRequestContext context,
+            int backlogSize,
+            int processors)
+        {
+            TimeSpan timeSpan = ((RequestScope)context.ContextData[nameof(RequestScope)]!).Elapsed;
+            Console.WriteLine($"{timeSpan} Scaled down to {processors} processors with backlog size {backlogSize}.");
+        }
+
+        private class RequestScope : IActivityScope
+        {
+            private readonly Stopwatch _stopwatch;
+
+            public RequestScope()
+            {
+                _stopwatch = Stopwatch.StartNew();
+                Console.WriteLine($"{DateTime.Now} Execute Request.");
+            }
+
+            public TimeSpan Elapsed => _stopwatch.Elapsed;
+
+            public void Dispose()
+            {
+                Console.WriteLine($"Completed in {Elapsed}");
+                _stopwatch.Stop();
+            }
+        }
+
+        private class BatchScope : IActivityScope
+        {
+            private RequestScope _requestScope;
+
+            public BatchScope(RequestScope requestScope)
+            {
+                _requestScope = requestScope;
+                Console.WriteLine($"{_requestScope.Elapsed} Begin Dispatching Batch.");
+            }
+
+            public void Dispose()
+            {
+                Console.WriteLine($"{_requestScope.Elapsed} End Dispatching Batch.");
+            }
         }
     }
 }

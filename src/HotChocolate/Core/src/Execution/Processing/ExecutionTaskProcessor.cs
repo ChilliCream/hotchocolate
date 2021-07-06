@@ -1,115 +1,107 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using HotChocolate.Fetching;
+using Microsoft.Extensions.ObjectPool;
 
 namespace HotChocolate.Execution.Processing
 {
     internal sealed class ExecutionTaskProcessor
     {
         private readonly IOperationContext _context;
+        private readonly IWorkBacklog _backlog;
+        private readonly ObjectPool<IExecutionTask?[]> _bufferPool;
+        private IBatchDispatcher _batchDispatcher = default!;
+        private CancellationToken _cancellationToken;
 
-        private ExecutionTaskProcessor(IOperationContext context)
+        public ExecutionTaskProcessor(
+            IOperationContext context,
+            IWorkBacklog backlog,
+            ObjectPool<IExecutionTask?[]> bufferPool)
         {
             _context = context;
-            context.Execution.Work.BackPressureLimitExceeded += ScaleProcessors;
+            _backlog = backlog;
+            _bufferPool = bufferPool;
+            _backlog.BackPressureLimitExceeded += ScaleProcessors;
         }
 
-        public static Task ExecuteAsync(IOperationContext operationContext)
+        public void Initialize(
+            IBatchDispatcher batchDispatcher,
+            CancellationToken cancellationToken)
         {
-            if (operationContext.Execution.Work.IsEmpty)
+            _batchDispatcher = batchDispatcher;
+            _cancellationToken = cancellationToken;
+        }
+
+        public void Clean()
+        {
+            _batchDispatcher = default!;
+            _cancellationToken = default;
+        }
+
+        private async Task ExecuteProcessorAsync()
+        {
+            IExecutionTask?[] buffer = _bufferPool.Get();
+
+            try
             {
-                return Task.CompletedTask;
+                await ProcessTasksAsync(_backlog, _batchDispatcher, buffer, _cancellationToken)
+                    .ConfigureAwait(false);
             }
-
-            return new ExecutionTaskProcessor(operationContext).ExecuteMainProcessorAsync();
-        }
-        private async Task ExecuteMainProcessorAsync()
-        {
-            IExecutionContext executionContext = _context.Execution;
-            CancellationToken cancellationToken = _context.RequestAborted;
-            IExecutionTask?[] buffer = executionContext.TaskBuffers.Get();
-
-            do
+            finally
             {
-                try
-                {
-                    do
-                    {
-                        var work = executionContext.Work.TryTake(buffer, true);
-
-                        if (work == 0)
-                        {
-                            break;
-                        }
-
-                        if (buffer[0]!.IsSerial)
-                        {
-                            try
-                            {
-                                executionContext.BatchDispatcher.DispatchOnSchedule = true;
-
-                                for (var i = 0; i < work; i++)
-                                {
-                                    IExecutionTask task = buffer[i]!;
-                                    task.BeginExecute(cancellationToken);
-                                    await task.WaitForCompletionAsync(cancellationToken);
-                                }
-                            }
-                            finally
-                            {
-                                executionContext.BatchDispatcher.DispatchOnSchedule = false;
-                            }
-                        }
-                        else
-                        {
-                            for (var i = 0; i < work; i++)
-                            {
-                                buffer[i]!.BeginExecute(cancellationToken);
-                            }
-                        }
-                    } while (!cancellationToken.IsCancellationRequested);
-
-                    await executionContext.Work
-                        .WaitForWorkAsync(cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    if (!cancellationToken.IsCancellationRequested)
-                    {
-                        HandleError(ex);
-                    }
-                }
-            } while (!cancellationToken.IsCancellationRequested &&
-                !executionContext.IsCompleted);
-
-            executionContext.TaskBuffers.Return(buffer);
+                _bufferPool.Return(buffer);
+            }
         }
 
-        private async Task ExecuteSecondaryProcessorAsync()
+        private async Task ProcessTasksAsync(
+            IWorkBacklog backlog,
+            IBatchDispatcher batchDispatcher,
+            IExecutionTask?[] buffer,
+            CancellationToken cancellationToken)
         {
-            IExecutionContext executionContext = _context.Execution;
-            CancellationToken cancellationToken = _context.RequestAborted;
-
-            await Task.Yield();
-
-            IExecutionTask?[] buffer = executionContext.TaskBuffers.Get();
-
             RESTART:
             try
             {
                 do
                 {
-                    var work = executionContext.Work.TryTake(buffer, false);
+                    var work = backlog.TryTake(buffer);
 
-                    if (work == 0)
+                    if (work is 0)
                     {
                         break;
                     }
 
-                    for (var i = 0; i < work; i++)
+                    if (buffer[0]!.IsSerial)
                     {
-                        buffer[i]!.BeginExecute(cancellationToken);
+                        try
+                        {
+                            batchDispatcher.DispatchOnSchedule = true;
+
+                            for (var i = 0; i < work; i++)
+                            {
+                                IExecutionTask task = buffer[i]!;
+                                task.BeginExecute(cancellationToken);
+                                await task.WaitForCompletionAsync(cancellationToken)
+                                    .ConfigureAwait(false);
+
+                                if (cancellationToken.IsCancellationRequested)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            batchDispatcher.DispatchOnSchedule = false;
+                        }
+                    }
+                    else
+                    {
+                        for (var i = 0; i < work; i++)
+                        {
+                            buffer[i]!.BeginExecute(cancellationToken);
+                        }
                     }
                 } while (!cancellationToken.IsCancellationRequested);
             }
@@ -121,12 +113,12 @@ namespace HotChocolate.Execution.Processing
                 }
             }
 
-            if (!executionContext.Work.TryCompleteProcessor())
+            // if there is no more work we will try to scale down.
+            // Note: we always trigger this method, even if the request was canceled.
+            if (!backlog.TryCompleteProcessor())
             {
                 goto RESTART;
             }
-
-            executionContext.TaskBuffers.Return(buffer);
         }
 
         private void HandleError(Exception exception)
@@ -144,7 +136,7 @@ namespace HotChocolate.Execution.Processing
         private void ScaleProcessors(object? sender, EventArgs eventArgs)
         {
 #pragma warning disable 4014
-            ExecuteSecondaryProcessorAsync();
+            Task.Run(ExecuteProcessorAsync, _cancellationToken);
 #pragma warning restore 4014
         }
     }
