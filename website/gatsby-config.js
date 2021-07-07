@@ -16,6 +16,10 @@ module.exports = {
         link: `/docs/hotchocolate/`,
       },
       {
+        name: `Tutorials`,
+        link: `/tutorials/hotchocolate/`,
+      },
+      {
         name: `Support`,
         link: `/support`,
       },
@@ -91,6 +95,13 @@ module.exports = {
       options: {
         name: `blog`,
         path: `${__dirname}/src/blog`,
+      },
+    },
+    {
+      resolve: `gatsby-source-filesystem`,
+      options: {
+        name: `tutorials`,
+        path: `${__dirname}/src/tutorials`,
       },
     },
     {
