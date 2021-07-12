@@ -4,6 +4,8 @@ using System.Globalization;
 using HotChocolate.Configuration;
 using HotChocolate.Language;
 using HotChocolate.Properties;
+using HotChocolate.Types.Descriptors;
+using HotChocolate.Types.Descriptors.Definitions;
 
 namespace HotChocolate.Types.Factories
 {
@@ -87,68 +89,55 @@ namespace HotChocolate.Types.Factories
                     },
             };
 
-        public DirectiveType Create(
-            IBindingLookup bindingLookup,
-            IReadOnlySchemaOptions schemaOptions,
-            DirectiveDefinitionNode node)
+        public DirectiveType Create(IDescriptorContext context, DirectiveDefinitionNode node)
         {
-            if (bindingLookup is null)
+            var preserveSyntaxNodes = context.Options.PreserveSyntaxNodes;
+
+            var typeDefinition = new DirectiveTypeDefinition(
+                node.Name.Value,
+                node.Description?.Value,
+                isRepeatable: node.IsRepeatable);
+
+            if (context.Options.DefaultDirectiveVisibility is DirectiveVisibility.Public)
             {
-                throw new ArgumentNullException(nameof(bindingLookup));
+                typeDefinition.IsPublic = true;
             }
 
-            if (node is null)
+            if (preserveSyntaxNodes)
             {
-                throw new ArgumentNullException(nameof(node));
+                typeDefinition.SyntaxNode = node;
             }
 
-            ITypeBindingInfo bindingInfo =
-                bindingLookup.GetBindingInfo(node.Name.Value);
+            DeclareArguments(typeDefinition, node.Arguments, preserveSyntaxNodes);
+            DeclareLocations(typeDefinition, node);
 
-            return new DirectiveType(c =>
-            {
-                c.Name(node.Name.Value);
-                c.Description(node.Description?.Value);
-                c.SyntaxNode(schemaOptions.PreserveSyntaxNodes ? node : null);
-
-                if (bindingInfo.SourceType != null)
-                {
-                    c.Extend().OnBeforeCreate(
-                        t => t.RuntimeType = bindingInfo.SourceType);
-                }
-
-                if (node.IsRepeatable)
-                {
-                    c.Repeatable();
-                }
-
-                DeclareArguments(schemaOptions, c, node);
-                DeclareLocations(c, node);
-            });
+            return DirectiveType.CreateUnsafe(typeDefinition);
         }
 
         private static void DeclareArguments(
-            IReadOnlySchemaOptions schemaOptions,
-            IDirectiveTypeDescriptor typeDescriptor,
-            DirectiveDefinitionNode node)
+            DirectiveTypeDefinition parent,
+            IReadOnlyCollection<InputValueDefinitionNode> arguments,
+            bool preserveSyntaxNodes)
         {
-            foreach (InputValueDefinitionNode inputField in node.Arguments)
+            foreach (InputValueDefinitionNode argument in arguments)
             {
-                IDirectiveArgumentDescriptor descriptor = typeDescriptor
-                    .Argument(inputField.Name.Value)
-                    .Description(inputField.Description?.Value)
-                    .Type(inputField.Type)
-                    .SyntaxNode(schemaOptions.PreserveSyntaxNodes ? inputField : null);
+                var argumentDefinition = new DirectiveArgumentDefinition(
+                    argument.Name.Value,
+                    argument.Description?.Value,
+                    TypeReference.Create(argument.Type),
+                    argument.DefaultValue);
 
-                if (inputField.DefaultValue is { })
+                if (preserveSyntaxNodes)
                 {
-                    descriptor.DefaultValue(inputField.DefaultValue);
+                    argumentDefinition.SyntaxNode = argument;
                 }
+
+                parent.Arguments.Add(argumentDefinition);
             }
         }
 
         private static void DeclareLocations(
-            IDirectiveTypeDescriptor typeDescriptor,
+            DirectiveTypeDefinition parent,
             DirectiveDefinitionNode node)
         {
             foreach (NameNode location in node.Locations)
@@ -157,7 +146,7 @@ namespace HotChocolate.Types.Factories
                     location.Value,
                     out Language.DirectiveLocation parsedLocation))
                 {
-                    typeDescriptor.Location(MapDirectiveLocation(parsedLocation));
+                    parent.Locations.Add(MapDirectiveLocation(parsedLocation));
                 }
             }
         }
@@ -165,14 +154,15 @@ namespace HotChocolate.Types.Factories
         private static DirectiveLocation MapDirectiveLocation(
             Language.DirectiveLocation location)
         {
-            if (!_locs.TryGetValue(location, out DirectiveLocation l))
+            if (!_locs.TryGetValue(location, out DirectiveLocation loc))
             {
                 throw new NotSupportedException(string.Format(
                     CultureInfo.InvariantCulture,
                     TypeResources.DirectiveTypeFactory_LocationNotSupported,
                     location));
             }
-            return l;
+
+            return loc;
         }
     }
 }
